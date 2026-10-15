@@ -31,11 +31,15 @@ class PricingService {
   static extractVehicleRates(vehicle) {
     const hourlyRate = vehicle.price_per_hour !== null && vehicle.price_per_hour !== undefined
       ? Number(vehicle.price_per_hour)
-      : (vehicle.price_per_day ? Number(vehicle.price_per_day) / 24 : (vehicle.priceHourly ? Number(vehicle.priceHourly) : 0));
+      : (vehicle.pricePerHour !== null && vehicle.pricePerHour !== undefined
+          ? Number(vehicle.pricePerHour)
+          : (vehicle.price_per_day ? Number(vehicle.price_per_day) / 24 : (vehicle.pricePerDay ? Number(vehicle.pricePerDay) / 24 : (vehicle.priceHourly ? Number(vehicle.priceHourly) : 0))));
 
     const dailyRate = vehicle.price_per_day !== null && vehicle.price_per_day !== undefined
       ? Number(vehicle.price_per_day)
-      : (vehicle.priceDaily ? Number(vehicle.priceDaily) : roundMoney(hourlyRate * 24));
+      : (vehicle.pricePerDay !== null && vehicle.pricePerDay !== undefined
+          ? Number(vehicle.pricePerDay)
+          : (vehicle.priceDaily ? Number(vehicle.priceDaily) : roundMoney(hourlyRate * 24)));
 
     const threeHourRate = vehicle.price_3_hours !== null && vehicle.price_3_hours !== undefined
       ? Number(vehicle.price_3_hours)
