@@ -13,6 +13,7 @@ const {
   disconnectRedis,
 } = require('./config');
 const noShowAutoCancellationService = require('./services/no-show-cancellation.service');
+const paymentTimeoutService = require('./services/payment-timeout.service');
 
 /**
  * GONGO Customer Backend — HTTP Server
@@ -65,6 +66,7 @@ async function shutdown(signal) {
     }
 
     await noShowAutoCancellationService.stopScheduler();
+    await paymentTimeoutService.stopScheduler();
     await disconnectDatabase();
     await disconnectRedis();
 
@@ -97,8 +99,9 @@ async function start() {
         environment: env.NODE_ENV,
         apiBase: `/api/${env.API_VERSION}`,
       });
-      // Start background no-show auto-cancellation scheduler
+      // Start background schedulers
       noShowAutoCancellationService.startScheduler();
+      paymentTimeoutService.startScheduler();
     });
 
     // Handle server-level errors (e.g. EADDRINUSE)

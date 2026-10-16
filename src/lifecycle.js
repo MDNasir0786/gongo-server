@@ -65,6 +65,7 @@ function loadModules() {
 
 function loadWorkers() {
   const noShowService = require('../Customer/src/services/no-show-cancellation.service');
+  const paymentTimeoutService = require('../Customer/src/services/payment-timeout.service');
   const partnerOutbox = require('../Partner/src/services/outbox.service');
   const { defaultWorker: adminOutboxWorker } = require('../Admin/src/jobs/outbox.worker');
 
@@ -73,6 +74,11 @@ function loadWorkers() {
       name: 'customer:no-show-cancellation',
       start: () => noShowService.startScheduler(),
       stop: () => noShowService.stopScheduler(),
+    },
+    {
+      name: 'customer:payment-timeout',
+      start: () => paymentTimeoutService.startScheduler(),
+      stop: () => paymentTimeoutService.stopScheduler(),
     },
     {
       name: 'partner:outbox',

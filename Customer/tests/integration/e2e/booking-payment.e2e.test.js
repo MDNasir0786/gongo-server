@@ -308,7 +308,7 @@ describe('Booking & Payment E2E Integration — Phase 13', () => {
   // ────────────────────────────────────────────────────────────────────────────
   // 6. FAILED PAYMENT WEBHOOK
   // ────────────────────────────────────────────────────────────────────────────
-  it('marks payment as FAILED and preserves booking in PAYMENT_PENDING on payment failure', async () => {
+  it('marks payment as FAILED and transitions booking to CANCELLED on payment failure', async () => {
     const startAt = futureAt(20);
     const endAt = futureAt(21);
 
@@ -353,14 +353,12 @@ describe('Booking & Payment E2E Integration — Phase 13', () => {
 
     expect(webhookRes.status).toBe(200);
 
-    // Booking must NOT be PAYMENT_COMPLETED
+    // Booking must transition to CANCELLED
     const bookingCheck = await request(app)
       .get(`/api/v1/bookings/${bookingId}`)
       .set('Authorization', customer.token);
 
-    // The booking API DTO upper-cases non-cancelled statuses (BookingRepository.mapBookingDto),
-    // while BOOKING_STATUS.PAYMENT_PENDING is the lowercase DB value 'payment_pending'.
-    expect(bookingCheck.body.data.booking.status).toBe(BOOKING_STATUS.PAYMENT_PENDING.toUpperCase());
+    expect(bookingCheck.body.data.booking.status).toBe(BOOKING_STATUS.CANCELLED);
 
     // Payment must be FAILED
     const paymentCheck = await request(app)

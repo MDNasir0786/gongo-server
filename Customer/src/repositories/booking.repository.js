@@ -890,11 +890,11 @@ class BookingRepository extends BaseRepository {
       if (statusUpper === 'ACTIVE' || statusUpper === 'IN_PROGRESS' || statusUpper === 'ACTIVE_RENTAL') {
         conditions.push(`(b.status IN ('in_progress', 'vehicle_picked', 'ACTIVE', 'active', 'IN_PROGRESS'))`);
       } else if (statusUpper === 'UPCOMING' || statusUpper === 'CONFIRMED') {
-        conditions.push(`(b.status IN ('confirmed', 'pickup_scheduled', 'initiated', 'payment_completed', 'CONFIRMED', 'PENDING', 'UPCOMING'))`);
+        conditions.push(`(b.status IN ('confirmed', 'pickup_scheduled', 'initiated', 'payment_completed', 'CONFIRMED', 'PENDING', 'UPCOMING') AND b.status NOT IN ('payment_pending', 'PAYMENT_PENDING'))`);
       } else if (statusUpper === 'COMPLETED') {
         conditions.push(`(b.status IN ('completed', 'returned', 'COMPLETED', 'RETURNED'))`);
       } else if (statusUpper === 'CANCELLED') {
-        conditions.push(`(b.status IN ('cancelled', 'refunded', 'CANCELLED', 'REFUNDED'))`);
+        conditions.push(`(b.status IN ('cancelled', 'refunded', 'CANCELLED', 'REFUNDED', 'payment_pending', 'PAYMENT_PENDING'))`);
       } else {
         conditions.push(`(b.status = $${paramIdx} OR LOWER(b.status) = LOWER($${paramIdx}))`);
         params.push(status);

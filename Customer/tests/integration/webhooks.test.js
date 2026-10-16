@@ -289,7 +289,7 @@ describe('Cashfree Webhook Integration Tests — Phase 10', () => {
       expect(replayRes.body.data.alreadyProcessed).toBe(true);
     });
 
-    it('6. marks payment FAILED on FAILED webhook and does NOT mark booking PAYMENT_COMPLETED', async () => {
+    it('6. marks payment FAILED on FAILED webhook and transitions booking to CANCELLED', async () => {
       const payload = {
         data: {
           order: { order_id: providerOrderId },
@@ -317,7 +317,7 @@ describe('Cashfree Webhook Integration Tests — Phase 10', () => {
       expect(payRow.failure_reason).toBe('Insufficient balance');
 
       const bookRow = db.public.one(`SELECT * FROM bookings WHERE id = '${bookingId}'`);
-      expect(bookRow.status).toBe(BOOKING_STATUS.PAYMENT_PENDING);
+      expect(bookRow.status).toBe(BOOKING_STATUS.CANCELLED);
     });
 
     it('7. detects amount tampering in webhook: rejects with 400 and marks payment FAILED', async () => {

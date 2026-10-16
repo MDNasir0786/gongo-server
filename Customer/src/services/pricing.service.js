@@ -32,32 +32,32 @@ class PricingService {
     const hourlyRate = vehicle.price_per_hour !== null && vehicle.price_per_hour !== undefined
       ? Number(vehicle.price_per_hour)
       : (vehicle.pricePerHour !== null && vehicle.pricePerHour !== undefined
-          ? Number(vehicle.pricePerHour)
-          : (vehicle.price_per_day ? Number(vehicle.price_per_day) / 24 : (vehicle.pricePerDay ? Number(vehicle.pricePerDay) / 24 : (vehicle.priceHourly ? Number(vehicle.priceHourly) : 0))));
+        ? Number(vehicle.pricePerHour)
+        : (vehicle.price_per_day ? Number(vehicle.price_per_day) / 24 : (vehicle.pricePerDay ? Number(vehicle.pricePerDay) / 24 : (vehicle.priceHourly ? Number(vehicle.priceHourly) : 0))));
 
     const dailyRate = vehicle.price_per_day !== null && vehicle.price_per_day !== undefined
       ? Number(vehicle.price_per_day)
       : (vehicle.pricePerDay !== null && vehicle.pricePerDay !== undefined
-          ? Number(vehicle.pricePerDay)
-          : (vehicle.priceDaily ? Number(vehicle.priceDaily) : roundMoney(hourlyRate * 24)));
+        ? Number(vehicle.pricePerDay)
+        : (vehicle.priceDaily ? Number(vehicle.priceDaily) : roundMoney(hourlyRate * 24)));
 
     const threeHourRate = vehicle.price_3_hours !== null && vehicle.price_3_hours !== undefined
       ? Number(vehicle.price_3_hours)
       : (vehicle.price3Hours !== null && vehicle.price3Hours !== undefined
-          ? Number(vehicle.price3Hours)
-          : roundMoney(hourlyRate * 3));
+        ? Number(vehicle.price3Hours)
+        : roundMoney(hourlyRate * 3));
 
     const sixHourRate = vehicle.price_6_hours !== null && vehicle.price_6_hours !== undefined
       ? Number(vehicle.price_6_hours)
       : (vehicle.price6Hours !== null && vehicle.price6Hours !== undefined
-          ? Number(vehicle.price6Hours)
-          : roundMoney(hourlyRate * 6));
+        ? Number(vehicle.price6Hours)
+        : roundMoney(hourlyRate * 6));
 
     const twelveHourRate = vehicle.price_12_hours !== null && vehicle.price_12_hours !== undefined
       ? Number(vehicle.price_12_hours)
       : (vehicle.price12Hours !== null && vehicle.price12Hours !== undefined
-          ? Number(vehicle.price12Hours)
-          : roundMoney(hourlyRate * 12));
+        ? Number(vehicle.price12Hours)
+        : roundMoney(hourlyRate * 12));
 
     const weeklyRate = vehicle.price_per_week !== null && vehicle.price_per_week !== undefined
       ? Number(vehicle.price_per_week)

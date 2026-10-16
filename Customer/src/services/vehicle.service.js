@@ -106,17 +106,22 @@ class VehicleService {
     if (storageKey.startsWith('http://') || storageKey.startsWith('https://')) {
       return storageKey;
     }
-    try {
-      const bucket = storageKey.startsWith('partners/') ? 'gongo-partner-documents' : 'gongo-uploads';
-      const presigned = await createPresignedGetUrl({
-        key: storageKey,
-        bucket,
-        expiresInSeconds: 86400,
-      });
-      return presigned?.downloadUrl || null;
-    } catch {
-      return null;
+    const candidateBuckets = ['gongo-uploads', 'gongo-partner-documents'];
+    for (const bucket of candidateBuckets) {
+      try {
+        const presigned = await createPresignedGetUrl({
+          key: storageKey,
+          bucket,
+          expiresInSeconds: 86400,
+        });
+        if (presigned?.downloadUrl) {
+          return presigned.downloadUrl;
+        }
+      } catch {
+        // try next candidate bucket
+      }
     }
+    return null;
   }
 
   /**

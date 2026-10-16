@@ -61,13 +61,20 @@ async function withSavepoint(client, name, fn) {
  * idempotency, and state machine transitions.
  */
 class PaymentService {
-  constructor(provider = cashfreeProvider) {
-    this.paymentRepository = new PaymentRepository();
-    this.bookingRepository = new BookingRepository();
-    this.userRepository = new UserRepository();
-    this.idempotencyRepository = new IdempotencyRepository();
-    this.documentRepository = new CustomerDocumentRepository();
-    this.provider = provider;
+  constructor(provider = cashfreeProvider, deps = {}) {
+    let prov = provider;
+    let dependencies = deps;
+    if (provider && typeof provider === 'object' && (provider.bookingRepository || provider.paymentRepository || provider.pool)) {
+      prov = provider.provider || cashfreeProvider;
+      dependencies = provider;
+    }
+    this.paymentRepository = dependencies.paymentRepository || new PaymentRepository();
+    this.bookingRepository = dependencies.bookingRepository || new BookingRepository();
+    this.userRepository = dependencies.userRepository || new UserRepository();
+    this.idempotencyRepository = dependencies.idempotencyRepository || new IdempotencyRepository();
+    this.documentRepository = dependencies.documentRepository || new CustomerDocumentRepository();
+    this.notificationService = dependencies.notificationService || notificationService;
+    this.provider = prov || cashfreeProvider;
     this.paymentLocks = new Map();
   }
 
@@ -363,13 +370,56 @@ class PaymentService {
               paymentId: payment.id,
             });
           }
-        } else if (orderStatus && (orderStatus.orderStatus === 'FAILED' || orderStatus.orderStatus === 'USER_DROPPED')) {
-          await this.paymentRepository.updateStatus(
-            payment.id,
-            PAYMENT_STATUS.FAILED,
-            { failureReason: 'PAYMENT_FAILED_OR_DROPPED' },
-          );
+        } else if (orderStatus && (orderStatus.orderStatus === 'FAILED' || orderStatus.orderStatus === 'USER_DROPPED' || orderStatus.orderStatus === 'CANCELLED' || orderStatus.orderStatus === 'EXPIRED')) {
+          await this.paymentRepository.transaction(async (client) => {
+            const lockedPayment = await this.paymentRepository.lockByProviderOrderId(
+              payment.providerOrderId,
+              client,
+            );
+            if (!lockedPayment) return null;
+            const lockedStatus = (lockedPayment.status || '').toLowerCase();
+            if (lockedStatus === 'paid' || lockedStatus === 'success') {
+              return { processed: true, alreadyProcessed: true };
+            }
+            const reason = orderStatus.orderStatus === 'USER_DROPPED'
+              ? 'USER_CANCELLED_PAYMENT'
+              : `PAYMENT_${orderStatus.orderStatus}`;
+            return this._applyPaymentFailure(client, lockedPayment, {
+              failureReason: reason,
+              cancellationReason: reason,
+            });
+          });
           payment.status = PAYMENT_STATUS.FAILED;
+          payment.failureReason = orderStatus.orderStatus === 'USER_DROPPED'
+            ? 'USER_CANCELLED_PAYMENT'
+            : `PAYMENT_${orderStatus.orderStatus}`;
+        }
+
+        // Apply 5-minute timeout deadline check if payment remains pending
+        const PAYMENT_TIMEOUT_MS = Number(process.env.PAYMENT_TIMEOUT_MS || (5 * 60 * 1000));
+        const paymentInitiatedAt = payment.createdAt ? new Date(payment.createdAt).getTime() : Date.now();
+        const isExpired = (Date.now() - paymentInitiatedAt) >= PAYMENT_TIMEOUT_MS;
+
+        if (isExpired && (payment.status || '').toLowerCase() !== 'paid' && (payment.status || '').toLowerCase() !== 'success') {
+          if (!orderStatus || orderStatus.orderStatus === 'ACTIVE') {
+            await this.paymentRepository.transaction(async (client) => {
+              const lockedPayment = await this.paymentRepository.lockByProviderOrderId(
+                payment.providerOrderId,
+                client,
+              );
+              if (!lockedPayment) return null;
+              const lockedStatus = (lockedPayment.status || '').toLowerCase();
+              if (lockedStatus === 'paid' || lockedStatus === 'success') {
+                return { processed: true, alreadyProcessed: true };
+              }
+              return this._applyPaymentFailure(client, lockedPayment, {
+                failureReason: 'PAYMENT_TIMEOUT',
+                cancellationReason: 'PAYMENT_TIMEOUT',
+              });
+            });
+            payment.status = PAYMENT_STATUS.FAILED;
+            payment.failureReason = 'PAYMENT_TIMEOUT';
+          }
         }
       } catch (err) {
         logger.warn('Payment provider status poll check skipped or failed', {
@@ -379,9 +429,17 @@ class PaymentService {
       }
     }
 
+    // Query authoritative latest booking status
+    let bookingStatus = booking.status;
+    try {
+      const freshBooking = await this.bookingRepository.findByIdAndCustomerId(bookingId, customerId);
+      if (freshBooking) bookingStatus = freshBooking.status;
+    } catch (_) {}
+
     return {
       paymentId: payment.id,
       bookingId: payment.bookingId,
+      bookingStatus,
       provider: payment.provider,
       providerOrderId: payment.providerOrderId,
       amount: payment.amount,
@@ -1011,41 +1069,41 @@ class PaymentService {
       // Best-effort: the savepoint keeps a failure here from aborting the payment update.
       try {
         await withSavepoint(client, 'sp_partner_earnings', async () => {
-        bRes = await client.query(
-          `SELECT b.id, b.booking_reference, b.booking_number, COALESCE(b.partner_id, v.partner_id) AS partner_id, b.subtotal, NULL::numeric AS rental_amount, b.total_amount, b.created_at, v.id AS vehicle_id, v.category_id
+          bRes = await client.query(
+            `SELECT b.id, b.booking_reference, b.booking_number, COALESCE(b.partner_id, v.partner_id) AS partner_id, b.subtotal, NULL::numeric AS rental_amount, b.total_amount, b.created_at, v.id AS vehicle_id, v.category_id
            FROM bookings b
            JOIN vehicles v ON v.id = b.vehicle_id
            WHERE b.id = $1`,
-          [lockedPayment.booking_id],
-        );
-        if (bRes.rows && bRes.rows[0] && bRes.rows[0].partner_id) {
-          const partnerId = bRes.rows[0].partner_id;
-          const bookingAmt = Number(lockedPayment.amount || bRes.rows[0].rental_amount || bRes.rows[0].subtotal || bRes.rows[0].total_amount || 0);
-          const bCreatedAt = bRes.rows[0].created_at || new Date();
+            [lockedPayment.booking_id],
+          );
+          if (bRes.rows && bRes.rows[0] && bRes.rows[0].partner_id) {
+            const partnerId = bRes.rows[0].partner_id;
+            const bookingAmt = Number(lockedPayment.amount || bRes.rows[0].rental_amount || bRes.rows[0].subtotal || bRes.rows[0].total_amount || 0);
+            const bCreatedAt = bRes.rows[0].created_at || new Date();
 
-          // Check if snapshot already exists
-          const existingSnap = await client.query(
-            `SELECT cr.partner_payable_amount, cr.commission_amount, e.commission_amount AS e_comm, e.partner_net_amount AS e_net
+            // Check if snapshot already exists
+            const existingSnap = await client.query(
+              `SELECT cr.partner_payable_amount, cr.commission_amount, e.commission_amount AS e_comm, e.partner_net_amount AS e_net
              FROM commission_records cr
              FULL OUTER JOIN earnings e ON e.booking_id = cr.booking_id
              WHERE cr.booking_id = $1 OR e.booking_id = $1
              LIMIT 1`,
-            [lockedPayment.booking_id]
-          );
+              [lockedPayment.booking_id]
+            );
 
-          let commAmount = 0;
-          let commRate = 0;
-          let commType = 'PERCENTAGE';
-          let ruleId = null;
-          let partnerNet = bookingAmt;
+            let commAmount = 0;
+            let commRate = 0;
+            let commType = 'PERCENTAGE';
+            let ruleId = null;
+            let partnerNet = bookingAmt;
 
-          if (existingSnap.rows[0] && (existingSnap.rows[0].partner_payable_amount !== null || Number(existingSnap.rows[0].e_comm) > 0)) {
-            commAmount = Number(existingSnap.rows[0].commission_amount ?? existingSnap.rows[0].e_comm ?? 0);
-            partnerNet = Number(existingSnap.rows[0].partner_payable_amount ?? existingSnap.rows[0].e_net ?? (bookingAmt - commAmount));
-          } else {
-            try {
-              const rRes = await client.query(
-                `SELECT * FROM commission_rules
+            if (existingSnap.rows[0] && (existingSnap.rows[0].partner_payable_amount !== null || Number(existingSnap.rows[0].e_comm) > 0)) {
+              commAmount = Number(existingSnap.rows[0].commission_amount ?? existingSnap.rows[0].e_comm ?? 0);
+              partnerNet = Number(existingSnap.rows[0].partner_payable_amount ?? existingSnap.rows[0].e_net ?? (bookingAmt - commAmount));
+            } else {
+              try {
+                const rRes = await client.query(
+                  `SELECT * FROM commission_rules
                  WHERE is_active = true
                    AND (effective_from IS NULL OR effective_from <= $1)
                    AND (effective_until IS NULL OR effective_until >= $1)
@@ -1066,51 +1124,51 @@ class PaymentService {
                    priority DESC,
                    created_at DESC
                  LIMIT 1`,
-                [bCreatedAt, bRes.rows[0].vehicle_id, partnerId, bRes.rows[0].category_id || null]
-              );
-              const matchedRule = rRes.rows[0];
-              if (matchedRule) {
-                ruleId = matchedRule.id;
-                commType = String(matchedRule.commission_type || 'percentage').toUpperCase();
-                if (commType === 'PERCENTAGE') {
-                  commRate = Number(matchedRule.commission_value || 0);
-                  commAmount = Number(((bookingAmt * commRate) / 100).toFixed(2));
-                } else {
-                  commRate = 0;
-                  commAmount = Math.min(bookingAmt, Number(Number(matchedRule.commission_value || 0).toFixed(2)));
+                  [bCreatedAt, bRes.rows[0].vehicle_id, partnerId, bRes.rows[0].category_id || null]
+                );
+                const matchedRule = rRes.rows[0];
+                if (matchedRule) {
+                  ruleId = matchedRule.id;
+                  commType = String(matchedRule.commission_type || 'percentage').toUpperCase();
+                  if (commType === 'PERCENTAGE') {
+                    commRate = Number(matchedRule.commission_value || 0);
+                    commAmount = Number(((bookingAmt * commRate) / 100).toFixed(2));
+                  } else {
+                    commRate = 0;
+                    commAmount = Math.min(bookingAmt, Number(Number(matchedRule.commission_value || 0).toFixed(2)));
+                  }
                 }
-              }
-              partnerNet = Math.max(0, Number((bookingAmt - commAmount).toFixed(2)));
-            } catch {}
+                partnerNet = Math.max(0, Number((bookingAmt - commAmount).toFixed(2)));
+              } catch { }
 
-            // Lock immutable snapshots
-            try {
-              await client.query(
-                `INSERT INTO commission_records (
+              // Lock immutable snapshots
+              try {
+                await client.query(
+                  `INSERT INTO commission_records (
                    booking_id, partner_id, commission_type, commission_rate,
                    gross_booking_amount, commission_amount, partner_payable_amount, status, created_at, updated_at
                  )
                  VALUES ($1, $2, $3, $4, $5, $6, $7, 'LOCKED', $8, CURRENT_TIMESTAMP)
                  ON CONFLICT (booking_id) DO NOTHING`,
-                [lockedPayment.booking_id, partnerId, commType, commRate, bookingAmt, commAmount, partnerNet, bCreatedAt]
-              );
-            } catch {}
+                  [lockedPayment.booking_id, partnerId, commType, commRate, bookingAmt, commAmount, partnerNet, bCreatedAt]
+                );
+              } catch { }
 
-            try {
-              await client.query(
-                `INSERT INTO commission_transactions (
+              try {
+                await client.query(
+                  `INSERT INTO commission_transactions (
                    booking_id, partner_id, commission_rule_id, commission_type, commission_rate,
                    base_amount, commission_amount, currency, status, created_at
                  )
                  VALUES ($1, $2, $3, $4, $5, $6, $7, 'INR', 'COMMISSION_LOCKED', $8)
                  ON CONFLICT DO NOTHING`,
-                [lockedPayment.booking_id, partnerId, ruleId, commType, commRate, bookingAmt, commAmount, bCreatedAt]
-              );
-            } catch {}
-          }
+                  [lockedPayment.booking_id, partnerId, ruleId, commType, commRate, bookingAmt, commAmount, bCreatedAt]
+                );
+              } catch { }
+            }
 
-          await client.query(
-            `INSERT INTO earnings (partner_id, booking_id, gross_amount, commission_amount, net_earnings, partner_net_amount, settlement_status, created_at, updated_at)
+            await client.query(
+              `INSERT INTO earnings (partner_id, booking_id, gross_amount, commission_amount, net_earnings, partner_net_amount, settlement_status, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $5, 'PENDING', $6, CURRENT_TIMESTAMP)
              ON CONFLICT (booking_id) DO UPDATE SET
                partner_id = EXCLUDED.partner_id,
@@ -1118,18 +1176,18 @@ class PaymentService {
                commission_amount = EXCLUDED.commission_amount,
                partner_net_amount = EXCLUDED.partner_net_amount,
                updated_at = CURRENT_TIMESTAMP`,
-            [partnerId, lockedPayment.booking_id, bookingAmt, commAmount, partnerNet, bCreatedAt],
-          );
+              [partnerId, lockedPayment.booking_id, bookingAmt, commAmount, partnerNet, bCreatedAt],
+            );
 
-          await client.query(
-            `INSERT INTO wallets (partner_id, available_balance, pending_balance, total_credited, total_debited, currency)
+            await client.query(
+              `INSERT INTO wallets (partner_id, available_balance, pending_balance, total_credited, total_debited, currency)
              VALUES ($1, 0.00, $2, 0.00, 0.00, 'INR')
              ON CONFLICT (partner_id) DO UPDATE SET
                pending_balance = wallets.pending_balance + EXCLUDED.pending_balance,
                updated_at = CURRENT_TIMESTAMP`,
-            [partnerId, partnerNet],
-          );
-        }
+              [partnerId, partnerNet],
+            );
+          }
         });
       } catch (eErr) {
         logger.warn('Non-fatal partner earning/wallet sync skipped', { error: eErr.message });
@@ -1186,6 +1244,226 @@ class PaymentService {
     }
 
     return { processed: true, status: PAYMENT_STATUS.SUCCESS };
+  }
+
+  /**
+   * Applies confirmed payment failure to a payment record and its associated booking.
+   *
+   * Idempotent & Race-Condition Safe:
+   * - Never cancels if a verified successful payment already exists.
+   * - Never cancels already confirmed, active, or completed bookings.
+   * - Transitions eligible advance bookings (payment_pending, initiated) to cancelled.
+   * - Inserts booking_cancellations audit row and restores vehicle availability to IDLE.
+   *
+   * @param {object} client - PostgreSQL transaction client
+   * @param {object} lockedPayment - FOR UPDATE locked payment row
+   * @param {object} options
+   * @param {string} [options.failureReason='PAYMENT_FAILED']
+   * @param {string} [options.providerPaymentId]
+   * @param {string} [options.cancellationReason]
+   * @returns {Promise<{ processed: boolean, status: string, bookingCancelled: boolean }>}
+   */
+  async _applyPaymentFailure(client, lockedPayment, {
+    failureReason = 'PAYMENT_FAILED',
+    providerPaymentId = null,
+    cancellationReason = null,
+  } = {}) {
+    // 1. Mark payment FAILED
+    await this.paymentRepository.updateStatus(
+      lockedPayment.id,
+      PAYMENT_STATUS.FAILED,
+      {
+        failureReason,
+        providerPaymentId,
+      },
+      client,
+    );
+
+    if (this.provider.envMode === 'PRODUCTION') {
+      logger.info('[CASHFREE] Payment updated', {
+        paymentId: lockedPayment.id,
+        providerOrderId: lockedPayment.provider_order_id,
+        status: PAYMENT_STATUS.FAILED,
+      });
+    }
+
+    // Settlement and overtime payments do not cancel the primary booking
+    if (
+      lockedPayment.payment_type === PAYMENT_TYPE.POST_RENTAL_SETTLEMENT ||
+      lockedPayment.payment_type === PAYMENT_TYPE.OVERTIME_CHARGE
+    ) {
+      return { processed: true, status: PAYMENT_STATUS.FAILED, bookingCancelled: false };
+    }
+
+    // 2. Check if ANY successful payment exists for this booking (never overwrite success)
+    let hasSuccessfulPayment = false;
+    try {
+      const successCheckRes = await client.query(
+        `SELECT id FROM payments
+         WHERE booking_id = $1
+           AND status IN ('PAID', 'SUCCESS', 'paid', 'success')
+         LIMIT 1`,
+        [lockedPayment.booking_id],
+      );
+      hasSuccessfulPayment = successCheckRes.rows.length > 0;
+    } catch (_) {
+      // safe fallback
+    }
+
+    if (hasSuccessfulPayment) {
+      logger.warn('Skipping booking cancellation on payment failure: booking has a successful payment', {
+        bookingId: lockedPayment.booking_id,
+        paymentId: lockedPayment.id,
+      });
+      return { processed: true, status: PAYMENT_STATUS.FAILED, bookingCancelled: false, reason: 'SUCCESSFUL_PAYMENT_EXISTS' };
+    }
+
+    // 3. Lock associated booking row to check eligibility
+    let booking = null;
+    try {
+      const bookingRes = await client.query(
+        `SELECT id, customer_id, vehicle_id, status
+         FROM bookings
+         WHERE id = $1
+         FOR UPDATE`,
+        [lockedPayment.booking_id],
+      );
+      booking = bookingRes.rows[0];
+    } catch (_) {
+      const bookingRes = await client.query(
+        `SELECT id, customer_id, vehicle_id, status
+         FROM bookings
+         WHERE id = $1`,
+        [lockedPayment.booking_id],
+      );
+      booking = bookingRes.rows[0];
+    }
+
+    if (!booking) {
+      return { processed: true, status: PAYMENT_STATUS.FAILED, bookingCancelled: false, reason: 'BOOKING_NOT_FOUND' };
+    }
+
+    const currentStatus = String(booking.status || '').toLowerCase();
+    const currentBookingStatus = String(booking.booking_status || '').toUpperCase();
+
+    // Already cancelled or refunded
+    if (currentStatus === 'cancelled' || currentStatus === 'refunded' || currentBookingStatus === 'CANCELLED') {
+      return { processed: true, status: PAYMENT_STATUS.FAILED, bookingCancelled: false, reason: 'ALREADY_CANCELLED' };
+    }
+
+    // Confirmed or active rental cannot be cancelled by a failed payment attempt
+    if (
+      currentStatus === 'confirmed' ||
+      currentStatus === 'payment_completed' ||
+      currentStatus === 'pickup_scheduled' ||
+      currentStatus === 'vehicle_picked' ||
+      currentStatus === 'in_progress' ||
+      currentStatus === 'completed' ||
+      currentBookingStatus === 'CONFIRMED' ||
+      currentBookingStatus === 'ACTIVE' ||
+      currentBookingStatus === 'COMPLETED'
+    ) {
+      logger.warn('Skipping booking cancellation: booking is already confirmed or active', {
+        bookingId: booking.id,
+        status: currentStatus,
+      });
+      return { processed: true, status: PAYMENT_STATUS.FAILED, bookingCancelled: false, reason: 'BOOKING_NOT_ELIGIBLE' };
+    }
+
+    const resolvedReason = cancellationReason || failureReason || 'PAYMENT_FAILED';
+
+    // 4. Transition booking to cancelled
+    try {
+      await withSavepoint(client, 'sp_booking_cancel', () => client.query(
+        `UPDATE bookings
+         SET status = 'cancelled',
+             booking_status = 'CANCELLED',
+             cancellation_reason = $1,
+             cancelled_at = CURRENT_TIMESTAMP,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2`,
+        [resolvedReason, booking.id],
+      ));
+    } catch (updateErr) {
+      await client.query(
+        `UPDATE bookings
+         SET status = 'cancelled',
+             cancellation_reason = $1,
+             cancelled_at = CURRENT_TIMESTAMP,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2`,
+        [resolvedReason, booking.id],
+      );
+    }
+
+    // 5. Insert into booking_cancellations
+    try {
+      await withSavepoint(client, 'sp_booking_cancellations_insert', () => client.query(
+        `INSERT INTO booking_cancellations (
+           booking_id, cancelled_by, cancellation_reason, cancelled_at
+         ) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+         ON CONFLICT (booking_id) DO UPDATE
+         SET cancellation_reason = EXCLUDED.cancellation_reason,
+             cancelled_at = EXCLUDED.cancelled_at`,
+        [booking.id, booking.customer_id, resolvedReason],
+      ));
+    } catch {
+      // Ignored if booking_cancellations schema differs
+    }
+
+    // 6. Release vehicle availability to IDLE
+    try {
+      await withSavepoint(client, 'sp_vehicle_idle', () => client.query(
+        `UPDATE vehicles
+         SET rental_status = 'IDLE', updated_at = CURRENT_TIMESTAMP
+         WHERE id = (SELECT vehicle_id FROM bookings WHERE id = $1)
+           AND rental_status != 'ACTIVE'`,
+        [booking.id],
+      ));
+    } catch {
+      // Safe fallback if rental_status column not present
+    }
+
+    // 7. Insert into booking_status_history
+    try {
+      await withSavepoint(client, 'sp_status_history', () => client.query(
+        `INSERT INTO booking_status_history (
+           id, booking_id, old_status, new_status, changed_by, change_reason, created_at
+         ) VALUES (gen_random_uuid(), $1, $2, 'cancelled', NULL, $3, CURRENT_TIMESTAMP)`,
+        [booking.id, booking.status, resolvedReason],
+      ));
+    } catch {
+      // Non-fatal if table not present in test db
+    }
+
+    // 8. Send notification to customer
+    try {
+      await (this.notificationService || notificationService).sendNotification({
+        customerId: booking.customer_id,
+        type: NOTIFICATION_TYPES.BOOKING_CANCELLED,
+        title: 'Booking Cancelled',
+        body: 'Your booking was cancelled due to payment failure.',
+        data: {
+          bookingId: booking.id,
+          paymentId: lockedPayment.id,
+          reason: resolvedReason,
+        },
+        eventKey: `BOOKING_CANCELLED:payment_failed:${booking.id}`,
+      });
+    } catch (notifErr) {
+      logger.warn('Failed to dispatch booking cancellation notification', {
+        bookingId: booking.id,
+        error: notifErr.message,
+      });
+    }
+
+    logger.info('Booking transitioned to CANCELLED following confirmed payment failure', {
+      bookingId: booking.id,
+      paymentId: lockedPayment.id,
+      reason: resolvedReason,
+    });
+
+    return { processed: true, status: PAYMENT_STATUS.FAILED, bookingCancelled: true };
   }
 
   /**
@@ -1294,12 +1572,11 @@ class PaymentService {
             expectedAmount,
             receivedAmount: eventAmount,
           });
-          await this.paymentRepository.updateStatus(
-            lockedPayment.id,
-            PAYMENT_STATUS.FAILED,
-            { failureReason: 'AMOUNT_MISMATCH' },
-            client,
-          );
+          await this._applyPaymentFailure(client, lockedPayment, {
+            failureReason: 'AMOUNT_MISMATCH',
+            providerPaymentId,
+            cancellationReason: 'AMOUNT_MISMATCH',
+          });
           mismatchError = new BadRequestError(
             'Payment amount mismatch',
             PAYMENT_ERROR_CODES.PAYMENT_AMOUNT_MISMATCH,
@@ -1313,12 +1590,11 @@ class PaymentService {
             expectedCurrency: lockedPayment.currency,
             receivedCurrency: eventCurrency,
           });
-          await this.paymentRepository.updateStatus(
-            lockedPayment.id,
-            PAYMENT_STATUS.FAILED,
-            { failureReason: 'CURRENCY_MISMATCH' },
-            client,
-          );
+          await this._applyPaymentFailure(client, lockedPayment, {
+            failureReason: 'CURRENCY_MISMATCH',
+            providerPaymentId,
+            cancellationReason: 'CURRENCY_MISMATCH',
+          });
           mismatchError = new BadRequestError(
             'Payment currency mismatch',
             PAYMENT_ERROR_CODES.PAYMENT_CURRENCY_MISMATCH,
@@ -1349,50 +1625,18 @@ class PaymentService {
       );
 
       if (isFailureEvent) {
-        await this.paymentRepository.updateStatus(
-          lockedPayment.id,
-          PAYMENT_STATUS.FAILED,
-          {
-            failureReason: paymentData.payment_message || eventStatus,
-            providerPaymentId,
-          },
-          client,
-        );
+        const failureReason = paymentData.payment_message || eventStatus;
+        const cancellationReason = (
+          eventStatus === 'USER_DROPPED'
+          || eventStatus === 'CANCELLED'
+          || (failureReason && (String(failureReason).toLowerCase().includes('cancel') || String(failureReason).toLowerCase().includes('drop')))
+        ) ? 'PAYMENT_CANCELLED' : 'PAYMENT_FAILED';
 
-        logger.info('Payment marked FAILED via webhook', {
-          paymentId: lockedPayment.id,
-          providerOrderId,
-          reason: paymentData.payment_message,
+        return this._applyPaymentFailure(client, lockedPayment, {
+          failureReason,
+          providerPaymentId,
+          cancellationReason,
         });
-
-        try {
-          await notificationService.sendNotification({
-            customerId: lockedPayment.customer_id,
-            type: NOTIFICATION_TYPES.PAYMENT_FAILED,
-            title: 'Payment Failed',
-            body: 'Payment for your booking could not be completed.',
-            data: {
-              bookingId: lockedPayment.booking_id,
-              paymentId: lockedPayment.id,
-            },
-            eventKey: `PAYMENT_FAILED:payment:${lockedPayment.id}:${lockedPayment.customer_id}`,
-          });
-        } catch (err) {
-          logger.warn('Failed to dispatch payment failure notification', {
-            paymentId: lockedPayment.id,
-            error: err.message,
-          });
-        }
-
-        if (this.provider.envMode === 'PRODUCTION') {
-          logger.info('[CASHFREE] Payment updated', {
-            paymentId: lockedPayment.id,
-            providerOrderId,
-            status: PAYMENT_STATUS.FAILED,
-          });
-        }
-
-        return { processed: true, status: PAYMENT_STATUS.FAILED };
       }
 
       return { processed: true, status: lockedPayment.status };
@@ -1441,7 +1685,7 @@ class PaymentService {
       await this.paymentRepository.query(
         'UPDATE payments SET provider_order_id = $1 WHERE id = $2',
         [providerOrderId, payment.id]
-      ).catch(() => {});
+      ).catch(() => { });
     }
 
     const amount = Number(payment.amount);
