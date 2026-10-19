@@ -27,6 +27,43 @@ class CashfreeProvider extends PaymentProvider {
       : 'https://sandbox.cashfree.com/pg';
 
     this.mockDelegate = null;
+    this._recent404Orders = new Map();
+  }
+
+  /**
+   * Logs a concise, safe diagnostic warning for Cashfree 404 responses.
+   * Suppresses repeat log flooding for the same provider order reference within 5 minutes.
+   * NEVER logs secrets or credentials.
+   *
+   * @param {string} providerOrderId
+   * @param {object} [details]
+   */
+  _log404Once(providerOrderId, details = {}) {
+    const now = Date.now();
+    const lastLogged = this._recent404Orders.get(providerOrderId);
+    if (lastLogged && (now - lastLogged) < 5 * 60 * 1000) {
+      return;
+    }
+
+    // Prune stale cache entries if too large
+    if (this._recent404Orders.size > 1000) {
+      for (const [key, timestamp] of this._recent404Orders) {
+        if ((now - timestamp) > 5 * 60 * 1000) {
+          this._recent404Orders.delete(key);
+        }
+      }
+    }
+
+    this._recent404Orders.set(providerOrderId, now);
+
+    logger.warn('Cashfree order reference ID not found in environment (404)', {
+      providerOrderId,
+      envMode: this.envMode,
+      statusCode: 404,
+      bookingId: details.bookingId || undefined,
+      paymentId: details.paymentId || undefined,
+      message: details.message || 'Order Reference Id does not exist',
+    });
   }
 
   /**
@@ -188,11 +225,12 @@ class CashfreeProvider extends PaymentProvider {
    * Fetches order status from Cashfree.
    *
    * @param {string} providerOrderId
+   * @param {object} [metadata] Optional diagnostic context (e.g. bookingId, paymentId)
    * @returns {Promise<object>}
    */
-  async getOrderStatus(providerOrderId) {
+  async getOrderStatus(providerOrderId, metadata = {}) {
     if (this.mockDelegate && typeof this.mockDelegate.getOrderStatus === 'function') {
-      return this.mockDelegate.getOrderStatus(providerOrderId);
+      return this.mockDelegate.getOrderStatus(providerOrderId, metadata);
     }
 
     if (this.envMode === 'PRODUCTION') {
@@ -212,6 +250,23 @@ class CashfreeProvider extends PaymentProvider {
       const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
+        // Handle 404 cleanly across both PRODUCTION and SANDBOX environments
+        if (response.status === 404) {
+          this._log404Once(providerOrderId, {
+            message: data.message,
+            bookingId: metadata.bookingId,
+            paymentId: metadata.paymentId,
+          });
+          return {
+            providerOrderId,
+            orderStatus: 'NOT_FOUND',
+            notFound: true,
+            httpStatus: 404,
+            orderAmount: null,
+            orderCurrency: 'INR',
+          };
+        }
+
         if (this.envMode === 'SANDBOX') {
           return {
             providerOrderId,
